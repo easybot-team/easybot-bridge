@@ -5,6 +5,8 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.springwater.easybot.bridge.adapter.OpCodeAdapter;
+import com.springwater.easybot.bridge.logger.DefaultLoggerAdapter;
+import com.springwater.easybot.bridge.logger.ILogger;
 import com.springwater.easybot.bridge.message.Segment;
 import com.springwater.easybot.bridge.message.SegmentType;
 import com.springwater.easybot.bridge.model.PlayerInfo;
@@ -23,14 +25,14 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.*;
-import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
 import static com.springwater.easybot.bridge.message.Segment.getSegmentClass;
 
 public class BridgeClient implements WebSocketListener {
-    private static final Logger logger = Logger.getLogger("EasyBot");
+    @Setter
+    private static ILogger logger = new DefaultLoggerAdapter();
 
     @Getter
     private static final Gson gson = new GsonBuilder().registerTypeAdapter(OpCode.class, new OpCodeAdapter()).create();
@@ -120,7 +122,7 @@ public class BridgeClient implements WebSocketListener {
         Gson gson = getGson();
         Packet packet = gson.fromJson(message, Packet.class);
         if (packet == null || packet.getOpCode() == null) {
-            logger.warning("解析到空 packet 或 opCode，原始消息: " + message);
+            logger.warn("解析到空 packet 或 opCode，原始消息: " + message);
             return;
         }
 
@@ -204,7 +206,7 @@ public class BridgeClient implements WebSocketListener {
 
     @Override
     public void onWebSocketError(Throwable cause) {
-        logger.severe("连接遇到错误: " + cause);
+        logger.error("连接遇到错误: " + cause);
         synchronized (connectionLock) {
             isConnected = false;
         }
@@ -225,10 +227,10 @@ public class BridgeClient implements WebSocketListener {
                 s.getRemote().sendStringByFuture(message);
             } else {
                 // 如果当前 session 不可用，记录日志（可视需求改为缓冲重发等）
-                logger.warning("尝试发送消息但 session 不可用，消息被丢弃: " + message);
+                logger.warn("尝试发送消息但 session 不可用，消息被丢弃: " + message);
             }
         } catch (Exception e) {
-            logger.severe("发送消息失败: " + e.getMessage());
+            logger.error("发送消息失败: " + e.getMessage());
         }
     }
 
@@ -243,7 +245,7 @@ public class BridgeClient implements WebSocketListener {
                     send(gson.toJson(new HeartbeatPacket()));
                 }
             } catch (Throwable t) {
-                logger.severe("发送心跳失败: " + t);
+                logger.error("发送心跳失败: " + t);
             }
         }, 0, getHeartbeatInterval(), TimeUnit.SECONDS);
     }
@@ -283,7 +285,7 @@ public class BridgeClient implements WebSocketListener {
                     } catch (Exception ex) {
                         papiQueryResultPacket.setSuccess(false);
                         papiQueryResultPacket.setText(ex.getLocalizedMessage());
-                        logger.severe("执行Papi查询命令失败: " + ex);
+                        logger.error("执行Papi查询命令失败: " + ex);
                     }
                     GsonUtils.merge(gson, callBack, papiQueryResultPacket);
                     break;
@@ -298,7 +300,7 @@ public class BridgeClient implements WebSocketListener {
                     } catch (Exception ex) {
                         runCommandResultPacket.setSuccess(false);
                         runCommandResultPacket.setText(ex.getLocalizedMessage());
-                        logger.severe("执行命令失败: " + ex);
+                        logger.error("执行命令失败: " + ex);
                     }
                     GsonUtils.merge(gson, callBack, runCommandResultPacket);
                     break;
@@ -339,7 +341,7 @@ public class BridgeClient implements WebSocketListener {
                 }
             }
         } catch (Exception e) {
-            logger.severe("处理 packet 时发生异常: " + e);
+            logger.error("处理 packet 时发生异常: " + e);
         }
 
         send(gson.toJson(callBack));
@@ -455,7 +457,7 @@ public class BridgeClient implements WebSocketListener {
                 ClientUpgradeRequest request = new ClientUpgradeRequest();
                 client.connect(this, echoUri, request);
             } catch (Exception e) {
-                logger.severe("连接失败: " + e.getMessage());
+                logger.error("连接失败: " + e.getMessage());
                 synchronized (connectionLock) {
                     isConnected = false;
                 }
@@ -468,18 +470,18 @@ public class BridgeClient implements WebSocketListener {
         try {
             client.stop();
         } catch (Exception e) {
-            logger.severe("停止失败: " + e.getMessage());
+            logger.error("停止失败: " + e.getMessage());
         }
     }
 
     public void reconnect() {
         try {
             TimeUnit.SECONDS.sleep(5);
-            logger.warning("正在尝试重连服务器");
+            logger.warn("正在尝试重连服务器");
             connect();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            logger.severe("重连已终止!");
+            logger.error("重连已终止!");
         }
     }
 
@@ -492,7 +494,7 @@ public class BridgeClient implements WebSocketListener {
             this.uri = newUrl;
             connect();
         } catch (Exception e) {
-            logger.severe("重置URL失败: " + e.getMessage());
+            logger.error("重置URL失败: " + e.getMessage());
         }
     }
 
@@ -511,7 +513,7 @@ public class BridgeClient implements WebSocketListener {
             client.stop();
             executor.shutdownNow();
         } catch (Exception e) {
-            logger.severe("关闭连接失败: " + e.getMessage());
+            logger.error("关闭连接失败: " + e.getMessage());
         }
     }
 }
