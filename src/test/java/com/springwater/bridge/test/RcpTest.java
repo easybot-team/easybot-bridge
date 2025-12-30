@@ -14,12 +14,14 @@ import com.springwater.easybot.bridge.api.rpc.IBridgeRpcManager;
 import com.springwater.easybot.bridge.api.rpc.IRpcListener;
 import com.springwater.easybot.bridge.api.rpc.RpcContext;
 import com.springwater.easybot.bridge.packet.GetInstalledPluginResultPacket;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+@Tag("manual")
 public class RcpTest implements IRpcListener, IBridgeListener, IBridgeExtension {
     private final BridgeClient client = new BridgeClient("ws://127.0.0.1:26990/bridge", new MockBridgeBehavior());
 

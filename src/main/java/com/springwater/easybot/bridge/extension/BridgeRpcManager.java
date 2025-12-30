@@ -7,6 +7,7 @@ import com.springwater.easybot.bridge.api.rpc.BridgeRpc;
 import com.springwater.easybot.bridge.api.rpc.IBridgeRpcManager;
 import com.springwater.easybot.bridge.api.rpc.IRpcListener;
 import com.springwater.easybot.bridge.api.rpc.RpcContext;
+import lombok.Getter;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
@@ -15,13 +16,24 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 public class BridgeRpcManager implements IBridgeRpcManager {
-    private record RpcMethodHandler(IRpcListener listenerInstance, Method method, BridgeRpc annotation) {
+    @SuppressWarnings("ClassCanBeRecord") // 需要兼容 Java 8
+    private static class RpcMethodHandler {
+        @Getter
+        private final IRpcListener listenerInstance;
+        @Getter
+        private final Method method;
+        @Getter
+        private final BridgeRpc annotation;
+
+        public RpcMethodHandler(IRpcListener listenerInstance, Method method, BridgeRpc annotation) {
+            this.listenerInstance = listenerInstance;
+            this.method = method;
+            this.annotation = annotation;
+        }
     }
 
-    // Identifier -> (RpcMethodName -> Handler)
     private final Map<String, Map<String, RpcMethodHandler>> rpcRegistry = new ConcurrentHashMap<>();
 
-    // Extension -> List<IRpcListener>，用于 getRpcListeners 和 unregister
     private final Map<IBridgeExtension, List<IRpcListener>> extensionListenersMap = new ConcurrentHashMap<>();
 
     @Override
@@ -54,7 +66,6 @@ public class BridgeRpcManager implements IBridgeRpcManager {
         BridgeRpc annotation = method.getAnnotation(BridgeRpc.class);
         Parameter[] params = method.getParameters();
 
-        // 校验条件：有且只有一个参数，且参数类型为 RpcContext
         if (params.length != 1 || !RpcContext.class.isAssignableFrom(params[0].getType())) {
             BridgeClient.getLogger().warn("RPC 方法 " + method.getName() + " 签名不符合要求 (必须仅包含 RpcContext 参数)，已跳过。");
             return false;
@@ -66,7 +77,6 @@ public class BridgeRpcManager implements IBridgeRpcManager {
             return false;
         }
 
-        // 注册到 registry
         rpcRegistry.computeIfAbsent(extensionId, k -> new ConcurrentHashMap<>())
                 .put(rpcMethodName, new RpcMethodHandler(listener, method, annotation));
 
@@ -85,18 +95,9 @@ public class BridgeRpcManager implements IBridgeRpcManager {
 
     @Override
     public HashMap<IBridgeExtension, List<IRpcListener>> getRpcListeners() {
-        // 返回副本以保护内部数据
         return new HashMap<>(extensionListenersMap);
     }
 
-    /**
-     * 执行 RPC 调用
-     *
-     * @param identifier 扩展的标识符 (对应 register 时的 ID)
-     * @param method     RPC 方法名 (对应 @BridgeRpc 的 method 属性)
-     * @param context    上下文
-     * @return 处理后的上下文
-     */
     public RpcContext call(String identifier, String method, RpcContext context) {
         if (identifier == null || method == null) {
             return setContextError(context, "参数错误: identifier或method是null");
@@ -113,8 +114,7 @@ public class BridgeRpcManager implements IBridgeRpcManager {
         }
 
         try {
-            // 反射调用
-            handler.method.invoke(handler.listenerInstance, context);
+            handler.getMethod().invoke(handler.getListenerInstance(), context);
             return context;
         } catch (Throwable e) {
             BridgeClient.getLogger().error("执行 RPC [" + identifier + ":" + method + "] 时发生异常");
@@ -122,6 +122,7 @@ public class BridgeRpcManager implements IBridgeRpcManager {
             return setContextError(context, "内部错误: " + e.getLocalizedMessage());
         }
     }
+
     private RpcContext setContextError(RpcContext context, String errorMessage) {
         context.getError().addProperty("error", true);
         context.getError().addProperty("error_message", errorMessage);
