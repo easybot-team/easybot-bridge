@@ -7,39 +7,45 @@ import com.springwater.easybot.bridge.api.IBridgeExtension;
 import com.springwater.easybot.bridge.api.IBridgeExtensionApi;
 import com.springwater.easybot.bridge.api.IBridgeListener;
 import com.springwater.easybot.bridge.api.events.BridgeEvent;
+import lombok.Getter;
 import org.jetbrains.annotations.NotNull;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class BridgeEventManager implements IBridgeExtensionApi {
 
-    /**
-     * 异步事件执行线程池
-     * 使用 CachedThreadPool 策略，自动回收空闲线程
-     */
     private final ExecutorService asyncExecutor;
 
-    /**
-     * 内部封装类，保存 扩展实例、监听器实例、方法和优先级
-     * 实现了 Comparable 以便自动排序 (优先级高的在前)
-     */
-    private record RegisteredHandler(
-            IBridgeExtension extension,
-            IBridgeListener listener,
-            Method method,
-            BridgeHandlerPriority priority
-    ) implements Comparable<RegisteredHandler> {
+    @SuppressWarnings("ClassCanBeRecord") // 需要兼容 Java 8
+    private static class RegisteredHandler implements Comparable<RegisteredHandler> {
+        @Getter
+        private final IBridgeExtension extension;
+        @Getter
+        private final IBridgeListener listener;
+        @Getter
+        private final Method method;
+        private final BridgeHandlerPriority priority;
+
+        public RegisteredHandler(IBridgeExtension extension, IBridgeListener listener, Method method, BridgeHandlerPriority priority) {
+            this.extension = extension;
+            this.listener = listener;
+            this.method = method;
+            this.priority = priority;
+        }
+
         @Override
         public int compareTo(RegisteredHandler other) {
-            // 优先级枚举 ordinal 越大优先级越高，因此使用降序排列
             return Integer.compare(other.priority.ordinal(), this.priority.ordinal());
         }
     }
+
     private final Map<Class<? extends BridgeEvent>, List<RegisteredHandler>> handlersMap = new ConcurrentHashMap<>();
 
     public BridgeEventManager() {
@@ -69,7 +75,7 @@ public class BridgeEventManager implements IBridgeExtensionApi {
 
         List<Method> methods = Arrays.stream(listener.getClass().getMethods())
                 .filter(x -> x.isAnnotationPresent(BridgeEventHandler.class))
-                .toList();
+                .collect(Collectors.toList());
 
         if (methods.isEmpty()) {
             BridgeClient.getLogger().warn("注册警告: 事件处理器中没有任何处理函数 " + listener.getClass().getName());
@@ -114,8 +120,7 @@ public class BridgeEventManager implements IBridgeExtensionApi {
     public void unregister(IBridgeListener listener) {
         if (listener == null) return;
         handlersMap.values().forEach(list -> {
-            // CopyOnWriteArrayList 的 removeIf 是线程安全的
-            list.removeIf(handler -> handler.listener().equals(listener));
+            list.removeIf(handler -> handler.getListener().equals(listener));
         });
         BridgeClient.getLogger().info("已注销事件处理器: " + listener.getClass().getName());
     }
@@ -124,15 +129,10 @@ public class BridgeEventManager implements IBridgeExtensionApi {
     public Stream<IBridgeExtension> getExtensions() {
         return handlersMap.values().stream()
                 .flatMap(List::stream)
-                .map(RegisteredHandler::extension)
+                .map(RegisteredHandler::getExtension)
                 .distinct();
     }
 
-    /**
-     * 同步推送事件 (在当前线程执行)
-     *
-     * @param event 事件实例
-     */
     public void push(BridgeEvent event) {
         if (event == null) return;
         List<RegisteredHandler> handlersToExecute = new ArrayList<>();
@@ -150,19 +150,16 @@ public class BridgeEventManager implements IBridgeExtensionApi {
 
         for (RegisteredHandler handler : handlersToExecute) {
             try {
-                // 检查事件取消状态
                 if (event.isCancelled() && !event.isContinuePropagation()) {
-                    break; // 如果事件已取消且不再继续传播，则停止后续处理
+                    break;
                 }
 
-                handler.method().invoke(handler.listener(), event);
+                handler.getMethod().invoke(handler.getListener(), event);
 
             } catch (Throwable e) {
-                // 捕获所有异常，防止单个监听器崩溃影响后续监听器
                 BridgeClient.getLogger().error("处理事件 " + event.getClass().getSimpleName() + " 时发生异常: " +
-                        handler.listener().getClass().getName() + "#" + handler.method().getName());
-                // 如果是反射调用异常，打印其 Cause 会更有帮助
-                if (e instanceof java.lang.reflect.InvocationTargetException && e.getCause() != null) {
+                        handler.getListener().getClass().getName() + "#" + handler.getMethod().getName());
+                if (e instanceof InvocationTargetException && e.getCause() != null) {
                     BridgeClient.getLogger().error(e.getCause().toString());
                 } else {
                     BridgeClient.getLogger().error(e.toString());
@@ -171,12 +168,6 @@ public class BridgeEventManager implements IBridgeExtensionApi {
         }
     }
 
-    /**
-     * 异步推送事件 (在独立线程池中执行)
-     *
-     * @param event 事件实例
-     * @return CompletableFuture 任务句柄
-     */
     public CompletableFuture<Void> pushAsync(BridgeEvent event) {
         if (event == null) {
             return CompletableFuture.completedFuture(null);
@@ -191,9 +182,6 @@ public class BridgeEventManager implements IBridgeExtensionApi {
         }, asyncExecutor);
     }
 
-    /**
-     * 关闭事件管理器及其线程池
-     */
     public void shutdown() {
         BridgeClient.getLogger().info("正在关闭事件管理器...");
         handlersMap.clear();
