@@ -1,10 +1,19 @@
 package com.springwater.easybot.bridge;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
+import com.google.gson.*;
 import com.springwater.easybot.bridge.adapter.OpCodeAdapter;
+import com.springwater.easybot.bridge.api.IBridgeExtension;
+import com.springwater.easybot.bridge.api.events.lifecycle.BridgeConnectedAsyncEvent;
+import com.springwater.easybot.bridge.api.events.lifecycle.BridgeDisconnectedAsyncEvent;
+import com.springwater.easybot.bridge.api.events.lifecycle.BridgeOnlineAsyncEvent;
+import com.springwater.easybot.bridge.api.events.raw.BridgeSendPacketEvent;
+import com.springwater.easybot.bridge.api.events.raw.RawExecPacketEvent;
+import com.springwater.easybot.bridge.api.events.raw.RawPacketEvent;
+import com.springwater.easybot.bridge.api.rpc.BridgeRpc;
+import com.springwater.easybot.bridge.api.rpc.IRpcListener;
+import com.springwater.easybot.bridge.api.rpc.RpcContext;
+import com.springwater.easybot.bridge.extension.BridgeEventManager;
+import com.springwater.easybot.bridge.extension.BridgeRpcManager;
 import com.springwater.easybot.bridge.logger.DefaultLoggerAdapter;
 import com.springwater.easybot.bridge.logger.ILogger;
 import com.springwater.easybot.bridge.message.Segment;
@@ -20,10 +29,9 @@ import org.eclipse.jetty.websocket.api.WebSocketListener;
 import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
 
+import java.lang.reflect.Method;
 import java.net.URI;
-import java.util.List;
-import java.util.Objects;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -31,7 +39,15 @@ import java.util.stream.StreamSupport;
 import static com.springwater.easybot.bridge.message.Segment.getSegmentClass;
 
 public class BridgeClient implements WebSocketListener {
+
+    @Getter
+    private static final BridgeEventManager eventManager = new BridgeEventManager();
+
+    @Getter
+    private static final BridgeRpcManager rpcManager = new BridgeRpcManager();
+
     @Setter
+    @Getter
     private static ILogger logger = new DefaultLoggerAdapter();
 
     @Getter
@@ -42,7 +58,11 @@ public class BridgeClient implements WebSocketListener {
     private final BridgeBehavior behavior;
     private final Object connectionLock = new Object();
     private final ConcurrentHashMap<String, CompletableFuture<String>> callbackTasks = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService timeoutScheduler = Executors.newScheduledThreadPool(1);
+    private final ScheduledExecutorService timeoutScheduler = Executors.newScheduledThreadPool(1, r -> {
+        Thread t = new Thread(r, "BridgeClient-timeoutScheduler");
+        t.setDaemon(true);
+        return t;
+    });
     private final long timeoutSeconds = 5; // Timeout duration
 
     private Session session;
@@ -55,9 +75,16 @@ public class BridgeClient implements WebSocketListener {
     @Getter
     private String token;
 
+    @Setter
+    private HelloPacket helloPacket;
+
     private String uri;
     private boolean isConnected = false;
-    private ScheduledExecutorService heartbeatScheduler = Executors.newSingleThreadScheduledExecutor();
+    private ScheduledExecutorService heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "BridgeClient-heartbeatScheduler");
+        t.setDaemon(true);
+        return t;
+    });
 
     @Getter
     private boolean ready;
@@ -72,6 +99,15 @@ public class BridgeClient implements WebSocketListener {
         connect();
     }
 
+    private String perSend(Object packet) {
+        JsonObject object = GsonUtils.merge(gson, new JsonObject(), packet);
+        BridgeSendPacketEvent event = new BridgeSendPacketEvent(this);
+        event.setPacket(object);
+        event.setHasCallbackId(packet.getClass().isInstance(PacketWithCallBackId.class));
+        eventManager.push(event);
+        return gson.toJson(event.getPacket());
+    }
+
     /**
      * 发送并等待回调的异步方法
      */
@@ -82,7 +118,7 @@ public class BridgeClient implements WebSocketListener {
         CompletableFuture<String> future = new CompletableFuture<>();
         callbackTasks.put(callbackId, future);
 
-        send(gson.toJson(packet));
+        send(packet);
 
         ScheduledFuture<?> timeoutFuture = timeoutScheduler.schedule(() -> {
             CompletableFuture<String> removedFuture = callbackTasks.remove(callbackId);
@@ -109,6 +145,10 @@ public class BridgeClient implements WebSocketListener {
         synchronized (connectionLock) {
             isConnected = true;
         }
+
+        BridgeConnectedAsyncEvent event = new BridgeConnectedAsyncEvent(this);
+        event.setUrl(session.getUpgradeRequest().getRequestURI().toString());
+        eventManager.pushAsync(event);
     }
 
     /**
@@ -121,15 +161,24 @@ public class BridgeClient implements WebSocketListener {
         }
         Gson gson = getGson();
         Packet packet = gson.fromJson(message, Packet.class);
+        JsonObject body = gson.fromJson(message, JsonObject.class);
         if (packet == null || packet.getOpCode() == null) {
             logger.warn("解析到空 packet 或 opCode，原始消息: " + message);
+            return;
+        }
+
+        RawPacketEvent event = new RawPacketEvent(this);
+        event.setPacket(packet);
+        event.setBody(body);
+        eventManager.push(event);
+        if (event.isSkipInternalProcessing()) {
             return;
         }
 
         switch (packet.getOpCode()) {
             case Hello: {
                 HelloPacket helloPacket = gson.fromJson(message, HelloPacket.class);
-
+                setHelloPacket(helloPacket);
                 logger.info("已连接到主程序!");
                 logger.info(">>>主程序连接信息<<<");
                 logger.info("系统: " + helloPacket.getSystemName());
@@ -157,6 +206,11 @@ public class BridgeClient implements WebSocketListener {
                 startUpdateSyncSettings();
                 startHeartbeat();
                 ready = true;
+
+                BridgeOnlineAsyncEvent online = new BridgeOnlineAsyncEvent(this);
+                online.setIdentify(identifySuccessPacket);
+                online.setHostInfo(helloPacket);
+                eventManager.pushAsync(online);
                 break;
             }
             case Packet: {
@@ -201,6 +255,10 @@ public class BridgeClient implements WebSocketListener {
             heartbeatScheduler.shutdownNow();
         } catch (Exception ignored) {
         }
+        BridgeDisconnectedAsyncEvent event = new BridgeDisconnectedAsyncEvent(this);
+        event.setReason(reason);
+        event.setHost(session.getUpgradeRequest().getRequestURI().toString());
+        eventManager.pushAsync(event);
         reconnect();
     }
 
@@ -220,14 +278,16 @@ public class BridgeClient implements WebSocketListener {
 
     /* -------------------- 其余业务方法（保留/微调） -------------------- */
 
-    private void send(String message) {
+    private void send(Object packet) {
         try {
+            String body = perSend(packet);
             Session s = this.session;
             if (s != null && s.isOpen()) {
-                s.getRemote().sendStringByFuture(message);
+                s.getRemote().sendStringByFuture(body);
+                logger.info("已发送消息: " + body);
             } else {
                 // 如果当前 session 不可用，记录日志（可视需求改为缓冲重发等）
-                logger.warn("尝试发送消息但 session 不可用，消息被丢弃: " + message);
+                logger.warn("尝试发送消息但 session 不可用，消息被丢弃: " + body);
             }
         } catch (Exception e) {
             logger.error("发送消息失败: " + e.getMessage());
@@ -242,13 +302,15 @@ public class BridgeClient implements WebSocketListener {
         heartbeatScheduler.scheduleAtFixedRate(() -> {
             try {
                 if (session != null && session.isOpen()) {
-                    send(gson.toJson(new HeartbeatPacket()));
+                    send(new HeartbeatPacket());
                 }
             } catch (Throwable t) {
                 logger.error("发送心跳失败: " + t);
             }
         }, 0, getHeartbeatInterval(), TimeUnit.SECONDS);
     }
+
+    private final ExecutorService rpcExecutor = Executors.newFixedThreadPool(16);
 
     private void handlePacket(String message) {
         Gson gson = getGson();
@@ -258,93 +320,170 @@ public class BridgeClient implements WebSocketListener {
         callBack.addProperty("callback_id", packet.getCallBackId());
         callBack.addProperty("exec_op", packet.getOperation());
 
-        try {
-            switch (packet.getOperation()) {
-                case "GET_SERVER_INFO": {
-                    ServerInfo info = behavior.getInfo();
-                    GsonUtils.merge(gson, callBack, info);
-                    break;
-                }
-                case "UN_BIND_NOTIFY": {
-                    PlayerUnBindNotifyPacket unBindNotifyPacket = gson.fromJson(message, PlayerUnBindNotifyPacket.class);
-                    behavior.KickPlayer(unBindNotifyPacket.getPlayerName(), unBindNotifyPacket.getKickMessage());
-                    break;
-                }
-                case "BIND_SUCCESS_NOTIFY": {
-                    BindSuccessNotifyPacket bindSuccessNotifyPacket = gson.fromJson(message, BindSuccessNotifyPacket.class);
-                    behavior.BindSuccessBroadcast(bindSuccessNotifyPacket.getPlayerName(), bindSuccessNotifyPacket.getAccountId(), bindSuccessNotifyPacket.getAccountName());
-                    break;
-                }
-                case "PLACEHOLDER_API_QUERY": {
-                    PlaceholderApiQueryPacket placeholderApiQueryPacket = gson.fromJson(message, PlaceholderApiQueryPacket.class);
-                    PlaceholderApiQueryResultPacket papiQueryResultPacket = new PlaceholderApiQueryResultPacket();
-                    try {
-                        String papiQueryResult = behavior.papiQuery(placeholderApiQueryPacket.getPlayerName(), placeholderApiQueryPacket.getText());
-                        papiQueryResultPacket.setSuccess(true);
-                        papiQueryResultPacket.setText(papiQueryResult);
-                    } catch (Exception ex) {
-                        papiQueryResultPacket.setSuccess(false);
-                        papiQueryResultPacket.setText(ex.getLocalizedMessage());
-                        logger.error("执行Papi查询命令失败: " + ex);
-                    }
-                    GsonUtils.merge(gson, callBack, papiQueryResultPacket);
-                    break;
-                }
-                case "RUN_COMMAND": {
-                    RunCommandPacket runCommandPacket = gson.fromJson(message, RunCommandPacket.class);
-                    RunCommandResultPacket runCommandResultPacket = new RunCommandResultPacket();
-                    try {
-                        String runCommandResult = behavior.runCommand(runCommandPacket.getPlayerName(), runCommandPacket.getCommand(), runCommandPacket.isEnablePapi());
-                        runCommandResultPacket.setSuccess(true);
-                        runCommandResultPacket.setText(runCommandResult);
-                    } catch (Exception ex) {
-                        runCommandResultPacket.setSuccess(false);
-                        runCommandResultPacket.setText(ex.getLocalizedMessage());
-                        logger.error("执行命令失败: " + ex);
-                    }
-                    GsonUtils.merge(gson, callBack, runCommandResultPacket);
-                    break;
-                }
-                case "SEND_TO_CHAT": {
-                    SendToChatOldPacket sendToChatPacket = gson.fromJson(message, SendToChatOldPacket.class);
-                    JsonObject sendToChatPacketRaw = gson.fromJson(message, JsonObject.class);
-                    JsonElement extra = sendToChatPacketRaw.get("extra");
-                    if (extra == null || extra.isJsonNull()) {
-                        behavior.SyncToChat(sendToChatPacket.getText());
+        JsonObject body = gson.fromJson(message, JsonObject.class);
+        RawExecPacketEvent rawPacketEvent = new RawExecPacketEvent(this);
+        rawPacketEvent.setPacket(packet);
+        rawPacketEvent.setBody(body);
+        rawPacketEvent.setCallBack(callBack);
+        eventManager.push(rawPacketEvent);
+
+        if (!rawPacketEvent.isSkipInternalProcessing()) {
+            try {
+                switch (packet.getOperation()) {
+                    case "GET_SERVER_INFO": {
+                        ServerInfo info = behavior.getInfo();
+                        GsonUtils.merge(gson, callBack, info);
                         break;
                     }
-                    SendToChatPacket sendToChatPacketNew = gson.fromJson(message, SendToChatPacket.class);
-                    List<Segment> segments = StreamSupport.stream(sendToChatPacketNew.getExtra().getAsJsonArray().spliterator(), false).map(JsonElement::getAsJsonObject).map(extraObject -> {
-                        SegmentType extraType = SegmentType.getSegmentType(extraObject.get("type").getAsInt());
-                        if (extraType == null) return null;
-                        Class<? extends Segment> segmentClass = getSegmentClass(extraType);
-                        return segmentClass != null ? gson.fromJson(extraObject, segmentClass) : null;
-                    }).filter(Objects::nonNull).collect(Collectors.toList());
-                    behavior.SyncToChatExtra(segments, sendToChatPacket.getText());
-                    break;
+                    case "UN_BIND_NOTIFY": {
+                        PlayerUnBindNotifyPacket unBindNotifyPacket = gson.fromJson(message, PlayerUnBindNotifyPacket.class);
+                        behavior.KickPlayer(unBindNotifyPacket.getPlayerName(), unBindNotifyPacket.getKickMessage());
+                        break;
+                    }
+                    case "BIND_SUCCESS_NOTIFY": {
+                        BindSuccessNotifyPacket bindSuccessNotifyPacket = gson.fromJson(message, BindSuccessNotifyPacket.class);
+                        behavior.BindSuccessBroadcast(bindSuccessNotifyPacket.getPlayerName(), bindSuccessNotifyPacket.getAccountId(), bindSuccessNotifyPacket.getAccountName());
+                        break;
+                    }
+                    case "PLACEHOLDER_API_QUERY": {
+                        PlaceholderApiQueryPacket placeholderApiQueryPacket = gson.fromJson(message, PlaceholderApiQueryPacket.class);
+                        PlaceholderApiQueryResultPacket papiQueryResultPacket = new PlaceholderApiQueryResultPacket();
+                        try {
+                            String papiQueryResult = behavior.papiQuery(placeholderApiQueryPacket.getPlayerName(), placeholderApiQueryPacket.getText());
+                            papiQueryResultPacket.setSuccess(true);
+                            papiQueryResultPacket.setText(papiQueryResult);
+                        } catch (Exception ex) {
+                            papiQueryResultPacket.setSuccess(false);
+                            papiQueryResultPacket.setText(ex.getLocalizedMessage());
+                            logger.error("执行Papi查询命令失败: " + ex);
+                        }
+                        GsonUtils.merge(gson, callBack, papiQueryResultPacket);
+                        break;
+                    }
+                    case "RUN_COMMAND": {
+                        RunCommandPacket runCommandPacket = gson.fromJson(message, RunCommandPacket.class);
+                        RunCommandResultPacket runCommandResultPacket = new RunCommandResultPacket();
+                        try {
+                            String runCommandResult = behavior.runCommand(runCommandPacket.getPlayerName(), runCommandPacket.getCommand(), runCommandPacket.isEnablePapi());
+                            runCommandResultPacket.setSuccess(true);
+                            runCommandResultPacket.setText(runCommandResult);
+                        } catch (Exception ex) {
+                            runCommandResultPacket.setSuccess(false);
+                            runCommandResultPacket.setText(ex.getLocalizedMessage());
+                            logger.error("执行命令失败: " + ex);
+                        }
+                        GsonUtils.merge(gson, callBack, runCommandResultPacket);
+                        break;
+                    }
+                    case "SEND_TO_CHAT": {
+                        SendToChatOldPacket sendToChatPacket = gson.fromJson(message, SendToChatOldPacket.class);
+                        JsonObject sendToChatPacketRaw = gson.fromJson(message, JsonObject.class);
+                        JsonElement extra = sendToChatPacketRaw.get("extra");
+                        if (extra == null || extra.isJsonNull()) {
+                            behavior.SyncToChat(sendToChatPacket.getText());
+                            break;
+                        }
+                        SendToChatPacket sendToChatPacketNew = gson.fromJson(message, SendToChatPacket.class);
+                        List<Segment> segments = StreamSupport.stream(sendToChatPacketNew.getExtra().getAsJsonArray().spliterator(), false).map(JsonElement::getAsJsonObject).map(extraObject -> {
+                            SegmentType extraType = SegmentType.getSegmentType(extraObject.get("type").getAsInt());
+                            if (extraType == null) return null;
+                            Class<? extends Segment> segmentClass = getSegmentClass(extraType);
+                            return segmentClass != null ? gson.fromJson(extraObject, segmentClass) : null;
+                        }).filter(Objects::nonNull).collect(Collectors.toList());
+                        behavior.SyncToChatExtra(segments, sendToChatPacket.getText());
+                        break;
+                    }
+                    case "SYNC_SETTINGS_UPDATED": {
+                        UpdateSyncSettingsPacket updateSyncSettingsPacket = gson.fromJson(message, UpdateSyncSettingsPacket.class);
+                        ClientProfile.setSyncMessageMoney(updateSyncSettingsPacket.getSyncMoney());
+                        ClientProfile.setSyncMessageMode(updateSyncSettingsPacket.getSyncMode());
+                        break;
+                    }
+                    case "PLAYER_LIST": {
+                        PlayerListPacket playerListPacket = new PlayerListPacket();
+                        playerListPacket.setList(behavior.getPlayerList());
+                        GsonUtils.merge(gson, callBack, playerListPacket);
+                        break;
+                    }
+                    case "RPC_CALL":
+                        rpcExecutor.execute(() -> {
+                            RpcCallPacket rpcCallPacket = gson.fromJson(message, RpcCallPacket.class);
+                            RpcContext context = new RpcContext(
+                                    this,
+                                    rpcCallPacket.getBody()
+                            );
+                            try {
+                                context = rpcManager.call(rpcCallPacket.getIdentifier(), rpcCallPacket.getMethod(), context);
+                                context.getError().addProperty("error", false);
+                            } catch (Exception ex) {
+                                logger.error("调用RPC方法失败: " + ex.getLocalizedMessage());
+                                context.getError().addProperty("error", true);
+                                context.getError().addProperty("error_message", ex.getLocalizedMessage());
+                            }
+
+                            if (context.getError().get("error").getAsBoolean()) {
+                                callBack.addProperty("error", true);
+                                callBack.addProperty("error_message", context.getError().get("error_message").getAsString());
+                            } else {
+                                callBack.addProperty("error", false);
+                                callBack.addProperty("error_message", "");
+                            }
+                            callBack.add("result", context.getResult());
+                            send(callBack);
+                        });
+                        break;
+                    case "GET_EXTENSIONS":
+                        JsonObject extensions = new JsonObject();
+                        Set<IBridgeExtension> listeners = new HashSet<>();
+                        HashMap<IBridgeExtension, List<IRpcListener>> extensionListenersMap = rpcManager.getRpcListeners();
+                        listeners.addAll(eventManager.getExtensions().toList());
+                        listeners.addAll(extensionListenersMap.keySet());
+
+                        for (IBridgeExtension extensionInstance : listeners) {
+                            JsonObject extension = new JsonObject();
+                            extension.addProperty("name", extensionInstance.getName());
+                            extension.addProperty("description", extensionInstance.getDescription());
+                            extension.addProperty("author", extensionInstance.getAuthor());
+                            extension.addProperty("version", extensionInstance.getVersion());
+                            extension.add("required_plugins",
+                                    gson.toJsonTree(extensionInstance.requiredPlugins())
+                            );
+                            extension.addProperty("identifier", extensionInstance.getIdentifier());
+                            if (extensionListenersMap.containsKey(extensionInstance)) {
+                                JsonObject rpc = new JsonObject();
+                                List<IRpcListener> listenerList = extensionListenersMap.get(extensionInstance);
+                                for (IRpcListener listener : listenerList) {
+                                    for (Method rpcFun : Arrays.stream(listener.getClass().getMethods()).filter(
+                                            method -> method.isAnnotationPresent(BridgeRpc.class)
+                                    ).toList()) {
+                                        JsonObject rpcMethod = new JsonObject();
+                                        BridgeRpc rpcAnnotation = rpcFun.getAnnotation(BridgeRpc.class);
+                                        rpcMethod.addProperty("identifier", extensionInstance.getIdentifier());
+                                        rpcMethod.addProperty("method", rpcAnnotation.method());
+                                        rpcMethod.addProperty("description", rpcAnnotation.description());
+                                        rpcMethod.addProperty("displayName", rpcAnnotation.displayName());
+                                        rpcMethod.addProperty("fullMethodClassName", rpcFun.getDeclaringClass().getName() + "." + rpcFun.getName());
+                                        rpc.add(rpcAnnotation.method(), rpcMethod);
+                                    }
+                                }
+                                extension.add("rpc", rpc);
+                            }
+                            extensions.add(extensionInstance.getIdentifier(), extension);
+                        }
+                        callBack.add("extensions", extensions);
+                        break;
+                    default: {
+                        logger.info("收到未知操作: " + packet.getOperation() + " 请确保你的插件是最新版本????");
+                        break;
+                    }
                 }
-                case "SYNC_SETTINGS_UPDATED": {
-                    UpdateSyncSettingsPacket updateSyncSettingsPacket = gson.fromJson(message, UpdateSyncSettingsPacket.class);
-                    ClientProfile.setSyncMessageMoney(updateSyncSettingsPacket.getSyncMoney());
-                    ClientProfile.setSyncMessageMode(updateSyncSettingsPacket.getSyncMode());
-                    break;
-                }
-                case "PLAYER_LIST": {
-                    PlayerListPacket playerListPacket = new PlayerListPacket();
-                    playerListPacket.setList(behavior.getPlayerList());
-                    GsonUtils.merge(gson, callBack, playerListPacket);
-                    break;
-                }
-                default: {
-                    logger.info("收到未知操作: " + packet.getOperation() + " 请确保你的插件是最新版本????");
-                    break;
-                }
+            } catch (Exception e) {
+                logger.error("处理 packet 时发生异常: " + e);
             }
-        } catch (Exception e) {
-            logger.error("处理 packet 时发生异常: " + e);
         }
 
-        send(gson.toJson(callBack));
+        if (!Objects.equals(packet.getOperation(), "RPC_CALL"))
+            send(callBack);
     }
 
     private void sendIdentifyPacket() {
@@ -352,7 +491,7 @@ public class BridgeClient implements WebSocketListener {
         IdentifyPacket packet = new IdentifyPacket(getToken());
         packet.setPluginVersion(ClientProfile.getPluginVersion());
         packet.setServerDescription(ClientProfile.getServerDescription());
-        send(gson.toJson(packet));
+        send(packet);
     }
 
     public PlayerLoginResultPacket login(String playerName, String playerUuid) throws ExecutionException, InterruptedException {
@@ -370,7 +509,7 @@ public class BridgeClient implements WebSocketListener {
         packet.setPlayerUuid(playerUuid);
         packet.setPlayerIp(playerIp);
         packet.setCallBackId("");
-        send(getGson().toJson(packet));
+        send(packet);
     }
 
     public void serverState(String players) {
@@ -378,7 +517,7 @@ public class BridgeClient implements WebSocketListener {
         packet.setToken(getToken());
         packet.setPlayers(players);
         packet.setCallBackId("");
-        send(getGson().toJson(packet));
+        send(packet);
     }
 
     public void dataRecord(RecordTypeEnum type, String data, String name) {
@@ -388,7 +527,7 @@ public class BridgeClient implements WebSocketListener {
         packet.setName(name);
         packet.setToken(getToken());
         packet.setCallBackId("");
-        send(getGson().toJson(packet));
+        send(packet);
     }
 
     public StartBindResultPacket startBind(String playerName) throws ExecutionException, InterruptedException {
@@ -419,7 +558,7 @@ public class BridgeClient implements WebSocketListener {
         packet.setMessage(message);
         packet.setUseCommand(useCommand);
         packet.setCallBackId("");
-        send(getGson().toJson(packet));
+        send(packet);
     }
 
     public void syncDeathMessage(PlayerInfoWithRaw playerInfo, String killMessage, String killer) {
@@ -428,7 +567,7 @@ public class BridgeClient implements WebSocketListener {
         packet.setRaw(killMessage);
         packet.setKiller(killer);
         packet.setCallBackId("");
-        send(getGson().toJson(packet));
+        send(packet);
     }
 
     public void syncEnterExit(PlayerInfoWithRaw playerInfo, boolean isEnter) {
@@ -436,7 +575,34 @@ public class BridgeClient implements WebSocketListener {
         packet.setPlayer(playerInfo);
         packet.setEnter(isEnter);
         packet.setCallBackId("");
-        send(getGson().toJson(packet));
+        send(packet);
+    }
+
+    public GetInstalledPluginResultPacket getInstalledPlugin() {
+        if (!identifySuccessPacket.isSupportGetPluginList())
+            throw new RuntimeException("您的EasyBot版本过旧,请升级到dev11及以上版本!");
+        GetInstalledPluginPacket packet = new GetInstalledPluginPacket();
+        packet.setCallBackId("");
+        packet.setOperation("INSTALLED_PLUGIN");
+        return sendAndWaitForCallbackAsync(packet, GetInstalledPluginResultPacket.class).join();
+    }
+
+    public JsonObject rpcCall(String identifier, String method, JsonObject body) {
+        RpcCallPacket packet = new RpcCallPacket();
+        packet.setIdentifier(identifier);
+        packet.setMethod(method);
+        packet.setBody(body);
+        packet.setOperation("RPC_CALL");
+        JsonObject result = sendAndWaitForCallbackAsync(packet, JsonObject.class).join();
+        if (result.get("error").getAsBoolean()) {
+            throw new RuntimeException("执行" + identifier + " 方法 " + method + "方法时发生错误: " + result.get("error_message").getAsString());
+        }
+        return result.get("result").getAsJsonObject();
+    }
+
+    public <T> T rpcCall(String identifier, String method, JsonObject body, Class<T> responseType) {
+        JsonObject resp = rpcCall(identifier, method, body);
+        return getGson().fromJson(resp, responseType);
     }
 
     /* -------------------- 连接管理 -------------------- */
@@ -501,7 +667,7 @@ public class BridgeClient implements WebSocketListener {
     public void startUpdateSyncSettings() {
         NeedSyncSettingsPacket packet = new NeedSyncSettingsPacket();
         packet.setCallBackId("");
-        send(getGson().toJson(packet));
+        send(packet);
     }
 
     public void close() {

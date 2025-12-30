@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'com.springwater.easybot'
-version = '1.4-SNAPSHOT'
+version = '1.5-rc.1'
 
 repositories {
     mavenCentral()
@@ -15,17 +15,34 @@ dependencies {
     api 'org.eclipse.jetty.websocket:websocket-client:9.4.58.v20250814'
     api 'org.eclipse.jetty.websocket:websocket-api:9.4.58.v20250814'
     implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'org.jetbrains:annotations:24.0.0'
+
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter-api'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine'
+
 
     compileOnly 'org.projectlombok:lombok:1.18.32'
     annotationProcessor 'org.projectlombok:lombok:1.18.32'
 }
 
 test {
-    useJUnitPlatform()
+    useJUnitPlatform {
+        excludeTags 'manual'
+    }
+}
+
+task manualTest(type: Test) {
+    group = 'verification'
+    description = '运行那些被标记为 manual 的手动测试'
+    useJUnitPlatform {
+        includeTags 'manual'
+    }
+    ignoreFailures = false
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_1_8
+    sourceCompatibility = JavaVersion.VERSION_16
 }
 
 publishing {

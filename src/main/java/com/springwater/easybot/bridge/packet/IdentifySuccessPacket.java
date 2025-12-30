@@ -6,7 +6,9 @@ import lombok.Setter;
 
 @Getter
 @Setter
-public class IdentifySuccessPacket extends Packet{
+public class IdentifySuccessPacket extends Packet {
     @SerializedName("server_name")
     private String serverName;
+    @SerializedName("support_get_plugin_list")
+    private boolean supportGetPluginList = false;
 }
