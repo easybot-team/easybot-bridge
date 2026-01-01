@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'com.springwater.easybot'
-version = '1.5-rc.2'
+version = '1.5'
 
 repositories {
     mavenCentral()
@@ -39,6 +39,7 @@ task manualTest(type: Test) {
         includeTags 'manual'
     }
     ignoreFailures = false
+    outputs.upToDateWhen { false }
 }
 
 java {

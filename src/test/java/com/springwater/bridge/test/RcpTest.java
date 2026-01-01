@@ -41,12 +41,8 @@ public class RcpTest implements IRpcListener, IBridgeListener, IBridgeExtension 
         client.setToken("JuxMzi6aCr1yHwm9aj0QDe1vvj0PtFzE");
         client.stop();
         System.out.println("等待 RPC 调用...");
-        boolean received = latch.await(120, TimeUnit.SECONDS);
-        if (received) {
-            System.out.println("成功收到 RPC 调用信号");
-        } else {
-            System.err.println("等待超时，未收到 RPC 调用");
-        }
+        latch.await();
+        System.out.println("成功收到 RPC 调用信号");
         // 等待一段时间
         Thread.sleep(5000);
         client.close();
@@ -87,6 +83,6 @@ public class RcpTest implements IRpcListener, IBridgeListener, IBridgeExtension 
 
     @Override
     public List<String> requiredPlugins() {
-        return List.of("rpc_test_plugin");
+        return List.of("rpc_test_plugin", "starlogin");
     }
 }

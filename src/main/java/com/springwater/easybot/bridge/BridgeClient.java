@@ -41,6 +41,9 @@ import static com.springwater.easybot.bridge.message.Segment.getSegmentClass;
 public class BridgeClient implements WebSocketListener {
 
     @Getter
+    private static BridgeClient instance;
+    
+    @Getter
     private static final BridgeEventManager eventManager = new BridgeEventManager();
 
     @Getter
@@ -96,6 +99,7 @@ public class BridgeClient implements WebSocketListener {
         this.behavior = behavior;
         this.client = new WebSocketClient();
         this.executor = Executors.newSingleThreadExecutor();
+        instance = this;
         connect();
     }
 
@@ -284,7 +288,7 @@ public class BridgeClient implements WebSocketListener {
             Session s = this.session;
             if (s != null && s.isOpen()) {
                 s.getRemote().sendStringByFuture(body);
-                logger.info("已发送消息: " + body);
+                //logger.info("已发送消息: " + body);
             } else {
                 // 如果当前 session 不可用，记录日志（可视需求改为缓冲重发等）
                 logger.warn("尝试发送消息但 session 不可用，消息被丢弃: " + body);
@@ -436,7 +440,7 @@ public class BridgeClient implements WebSocketListener {
                         JsonObject extensions = new JsonObject();
                         Set<IBridgeExtension> listeners = new HashSet<>();
                         HashMap<IBridgeExtension, List<IRpcListener>> extensionListenersMap = rpcManager.getRpcListeners();
-                        listeners.addAll(eventManager.getExtensions().toList());
+                        listeners.addAll(eventManager.getExtensions().collect(Collectors.toList()));
                         listeners.addAll(extensionListenersMap.keySet());
 
                         for (IBridgeExtension extensionInstance : listeners) {
@@ -455,7 +459,7 @@ public class BridgeClient implements WebSocketListener {
                                 for (IRpcListener listener : listenerList) {
                                     for (Method rpcFun : Arrays.stream(listener.getClass().getMethods()).filter(
                                             method -> method.isAnnotationPresent(BridgeRpc.class)
-                                    ).toList()) {
+                                    ).collect(Collectors.toList())) {
                                         JsonObject rpcMethod = new JsonObject();
                                         BridgeRpc rpcAnnotation = rpcFun.getAnnotation(BridgeRpc.class);
                                         rpcMethod.addProperty("identifier", extensionInstance.getIdentifier());
