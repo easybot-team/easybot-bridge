@@ -758,47 +758,49 @@ public class BridgeClient implements WebSocketListener {
         send(packet);
     }
 
-    public void close() {
-        isShutdown = true;
-        synchronized (connectionLock) {
-            isConnected = false;
-            isConnecting = false;
-        }
-        ready = false;
-
-        logger.info("BridgeClient 正在关闭...");
-        try {
-            if (heartbeatScheduler != null) {
-                heartbeatScheduler.shutdownNow();
+    public void close() throws InterruptedException {
+        new Thread(() -> {
+            isShutdown = true;
+            synchronized (connectionLock) {
+                isConnected = false;
+                isConnecting = false;
             }
-        } catch (Exception ignored) {
-        }
+            ready = false;
 
-        try {
-            if (session != null && session.isOpen()) {
-                session.close();
+            logger.info("BridgeClient 正在关闭...");
+            try {
+                if (heartbeatScheduler != null) {
+                    heartbeatScheduler.shutdownNow();
+                }
+            } catch (Exception ignored) {
             }
-        } catch (Exception e) {
-            logger.error("关闭 Session 失败: " + e.getMessage());
-        }
 
-        try {
-            if (client.isStarted()) {
-                client.stop();
+            try {
+                if (session != null && session.isOpen()) {
+                    session.close();
+                }
+            } catch (Exception e) {
+                logger.error("关闭 Session 失败: " + e.getMessage());
             }
-        } catch (Exception e) {
-            logger.error("停止 WebSocketClient 失败: " + e.getMessage());
-        }
-        try {
-            timeoutScheduler.shutdownNow();
-            executor.shutdownNow();
-            rpcExecutor.shutdownNow();
-            callbackTasks.values().forEach(f -> f.completeExceptionally(new CancellationException("Client closed")));
-            callbackTasks.clear();
-        } catch (Exception e) {
-            logger.error("关闭线程池失败: " + e.getMessage());
-        }
 
-        logger.info("BridgeClient 关闭完成。");
+            try {
+                if (client.isStarted()) {
+                    client.stop();
+                }
+            } catch (Exception e) {
+                logger.error("停止 WebSocketClient 失败: " + e.getMessage());
+            }
+            try {
+                timeoutScheduler.shutdownNow();
+                executor.shutdownNow();
+                rpcExecutor.shutdownNow();
+                callbackTasks.values().forEach(f -> f.completeExceptionally(new CancellationException("Client closed")));
+                callbackTasks.clear();
+            } catch (Exception e) {
+                logger.error("关闭线程池失败: " + e.getMessage());
+            }
+
+            logger.info("BridgeClient 关闭完成。");
+        }, "BridgeClient-Close").join(2000);
     }
 }
