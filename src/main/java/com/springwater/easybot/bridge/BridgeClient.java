@@ -24,6 +24,9 @@ import com.springwater.easybot.bridge.packet.*;
 import com.springwater.easybot.bridge.utils.GsonUtils;
 import lombok.Getter;
 import lombok.Setter;
+import org.eclipse.jetty.client.HttpClient;
+import org.eclipse.jetty.util.ssl.SslContextFactory;
+import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.eclipse.jetty.websocket.api.Session;
 import org.eclipse.jetty.websocket.api.WebSocketListener;
 import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
@@ -68,6 +71,7 @@ public class BridgeClient implements WebSocketListener {
         t.setDaemon(true);
         return t;
     });
+
     @SuppressWarnings("FieldCanBeLocal")
     private final long CallBackTimeout = 5;
 
@@ -106,7 +110,14 @@ public class BridgeClient implements WebSocketListener {
     public BridgeClient(String uri, BridgeBehavior behavior) {
         this.uri = uri;
         this.behavior = behavior;
-        this.client = new WebSocketClient();
+
+        QueuedThreadPool threadPool = new QueuedThreadPool(16);
+        threadPool.setDaemon(true);
+        threadPool.setName("EasyBotBridge-Jetty");
+        SslContextFactory.Client sslContextFactory = new SslContextFactory.Client();
+        HttpClient httpClient = new HttpClient(sslContextFactory);
+        httpClient.setExecutor(threadPool);
+        this.client = new WebSocketClient(httpClient);
         this.executor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "BridgeClient-Worker");
             t.setDaemon(true);
