@@ -42,7 +42,7 @@ public class BridgeClient implements WebSocketListener {
 
     @Getter
     private static BridgeClient instance;
-    
+
     @Getter
     private static final BridgeEventManager eventManager = new BridgeEventManager();
 
@@ -58,15 +58,18 @@ public class BridgeClient implements WebSocketListener {
 
     private final WebSocketClient client;
     private final ExecutorService executor;
+    private final ExecutorService rpcExecutor = Executors.newFixedThreadPool(16);
     private final BridgeBehavior behavior;
     private final Object connectionLock = new Object();
     private final ConcurrentHashMap<String, CompletableFuture<String>> callbackTasks = new ConcurrentHashMap<>();
+
     private final ScheduledExecutorService timeoutScheduler = Executors.newScheduledThreadPool(1, r -> {
         Thread t = new Thread(r, "BridgeClient-timeoutScheduler");
         t.setDaemon(true);
         return t;
     });
-    private final long timeoutSeconds = 5; // Timeout duration
+    @SuppressWarnings("FieldCanBeLocal")
+    private final long CallBackTimeout = 5;
 
     private Session session;
 
@@ -82,7 +85,11 @@ public class BridgeClient implements WebSocketListener {
     private HelloPacket helloPacket;
 
     private String uri;
-    private boolean isConnected = false;
+    private volatile boolean isConnected = false;
+
+    // 新增：标记是否正在关闭，防止重连死循环
+    private volatile boolean isShutdown = false;
+
     private ScheduledExecutorService heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "BridgeClient-heartbeatScheduler");
         t.setDaemon(true);
@@ -98,7 +105,12 @@ public class BridgeClient implements WebSocketListener {
         this.uri = uri;
         this.behavior = behavior;
         this.client = new WebSocketClient();
-        this.executor = Executors.newSingleThreadExecutor();
+        this.executor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "BridgeClient-Worker");
+            // 设置为非守护线程确保连接时不会意外退出，或者根据需求设为true
+            t.setDaemon(true);
+            return t;
+        });
         instance = this;
         connect();
     }
@@ -112,10 +124,13 @@ public class BridgeClient implements WebSocketListener {
         return gson.toJson(event.getPacket());
     }
 
-    /**
-     * 发送并等待回调的异步方法
-     */
     public <T> CompletableFuture<T> sendAndWaitForCallbackAsync(PacketWithCallBackId packet, Class<T> responseType) {
+        if (isShutdown) {
+            CompletableFuture<T> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IllegalStateException("BridgeClient is shutting down"));
+            return failed;
+        }
+
         String callbackId = UUID.randomUUID().toString();
         packet.setCallBackId(callbackId);
 
@@ -129,7 +144,7 @@ public class BridgeClient implements WebSocketListener {
             if (removedFuture != null) {
                 removedFuture.completeExceptionally(new TimeoutException("等待EasyBot返回结果超时!"));
             }
-        }, timeoutSeconds, TimeUnit.SECONDS);
+        }, CallBackTimeout, TimeUnit.SECONDS);
 
         return future.thenApply(result -> {
             timeoutFuture.cancel(false);
@@ -144,6 +159,10 @@ public class BridgeClient implements WebSocketListener {
 
     @Override
     public void onWebSocketConnect(Session session) {
+        if (isShutdown) {
+            session.close();
+            return;
+        }
         logger.info("已连接到服务器: " + session.getUpgradeRequest().getRequestURI());
         this.session = session;
         synchronized (connectionLock) {
@@ -155,11 +174,10 @@ public class BridgeClient implements WebSocketListener {
         eventManager.pushAsync(event);
     }
 
-    /**
-     * 文本消息入口（替代原 @OnWebSocketMessage）
-     */
     @Override
     public void onWebSocketText(String message) {
+        if (isShutdown) return;
+
         if (ClientProfile.isDebugMode()) {
             logger.info("收到消息: " + message);
         }
@@ -240,12 +258,8 @@ public class BridgeClient implements WebSocketListener {
         }
     }
 
-    /**
-     * 二进制消息（不使用，留空以满足接口）
-     */
     @Override
     public void onWebSocketBinary(byte[] payload, int offset, int len) {
-        // 不处理二进制消息
     }
 
     @Override
@@ -256,8 +270,13 @@ public class BridgeClient implements WebSocketListener {
         }
         ready = false;
         try {
-            heartbeatScheduler.shutdownNow();
+            if (heartbeatScheduler != null) {
+                heartbeatScheduler.shutdownNow();
+            }
         } catch (Exception ignored) {
+        }
+        if (isShutdown) {
+            return;
         }
         BridgeDisconnectedAsyncEvent event = new BridgeDisconnectedAsyncEvent(this);
         event.setReason(reason);
@@ -268,55 +287,71 @@ public class BridgeClient implements WebSocketListener {
 
     @Override
     public void onWebSocketError(Throwable cause) {
+        // 如果是主动关闭导致的 ClosedChannelException 等，直接忽略或记录Debug
+        if (isShutdown) {
+            return;
+        }
+
         logger.error("连接遇到错误: " + cause);
         synchronized (connectionLock) {
             isConnected = false;
         }
         ready = false;
         try {
-            heartbeatScheduler.shutdownNow();
+            if (heartbeatScheduler != null) {
+                heartbeatScheduler.shutdownNow();
+            }
         } catch (Exception ignored) {
         }
         reconnect();
     }
 
-    /* -------------------- 其余业务方法（保留/微调） -------------------- */
+    /* -------------------- 业务方法 -------------------- */
 
     private void send(Object packet) {
+        if (isShutdown) return;
         try {
             String body = perSend(packet);
             Session s = this.session;
             if (s != null && s.isOpen()) {
                 s.getRemote().sendStringByFuture(body);
-                //logger.info("已发送消息: " + body);
             } else {
-                // 如果当前 session 不可用，记录日志（可视需求改为缓冲重发等）
                 logger.warn("尝试发送消息但 session 不可用，消息被丢弃: " + body);
             }
         } catch (Exception e) {
-            logger.error("发送消息失败: " + e.getMessage());
+            if (!isShutdown) {
+                logger.error("发送消息失败: " + e.getMessage());
+            }
         }
     }
 
     private void startHeartbeat() {
-        if (!heartbeatScheduler.isShutdown()) {
+        if (isShutdown) return;
+        if (heartbeatScheduler != null && !heartbeatScheduler.isShutdown()) {
             heartbeatScheduler.shutdownNow();
         }
         heartbeatScheduler = Executors.newSingleThreadScheduledExecutor();
         heartbeatScheduler.scheduleAtFixedRate(() -> {
             try {
+                if (isShutdown) {
+                    throw new RuntimeException("Shutting down");
+                }
                 if (session != null && session.isOpen()) {
                     send(new HeartbeatPacket());
                 }
             } catch (Throwable t) {
-                logger.error("发送心跳失败: " + t);
+                if (!isShutdown) {
+                    logger.error("发送心跳失败: " + t);
+                }
             }
         }, 0, getHeartbeatInterval(), TimeUnit.SECONDS);
     }
 
-    private final ExecutorService rpcExecutor = Executors.newFixedThreadPool(16);
-
     private void handlePacket(String message) {
+        // 省略业务逻辑代码，保持原样...
+        // ... (原有的 handlePacket 代码逻辑完全保留)
+        // 建议在 rpcExecutor.execute 内部也加一个 if(isShutdown) return;
+
         Gson gson = getGson();
         PacketWithCallBackId packet = gson.fromJson(message, PacketWithCallBackId.class);
         JsonObject callBack = new JsonObject();
@@ -334,6 +369,7 @@ public class BridgeClient implements WebSocketListener {
         if (!rawPacketEvent.isSkipInternalProcessing()) {
             try {
                 switch (packet.getOperation()) {
+                    // ... (原有 Switch Case 逻辑保持不变) ...
                     case "GET_SERVER_INFO": {
                         ServerInfo info = behavior.getInfo();
                         GsonUtils.merge(gson, callBack, info);
@@ -411,6 +447,7 @@ public class BridgeClient implements WebSocketListener {
                     }
                     case "RPC_CALL":
                         rpcExecutor.execute(() -> {
+                            if (isShutdown) return; // 检查关闭
                             RpcCallPacket rpcCallPacket = gson.fromJson(message, RpcCallPacket.class);
                             RpcContext context = new RpcContext(
                                     this,
@@ -491,6 +528,7 @@ public class BridgeClient implements WebSocketListener {
     }
 
     private void sendIdentifyPacket() {
+        if (isShutdown) return;
         Gson gson = getGson();
         IdentifyPacket packet = new IdentifyPacket(getToken());
         packet.setPluginVersion(ClientProfile.getPluginVersion());
@@ -498,6 +536,9 @@ public class BridgeClient implements WebSocketListener {
         send(packet);
     }
 
+    // 省略 public 业务调用方法 (login, reportPlayer 等)，它们基本不变，
+    // 只是 sendAndWaitForCallbackAsync 内部已经处理了 isShutdown
+    // ...
     public PlayerLoginResultPacket login(String playerName, String playerUuid) throws ExecutionException, InterruptedException {
         OnPlayerJoinPacket packet = new OnPlayerJoinPacket();
         PlayerInfo playerInfo = new PlayerInfo();
@@ -612,26 +653,33 @@ public class BridgeClient implements WebSocketListener {
     /* -------------------- 连接管理 -------------------- */
 
     private void connect() {
+        if (isShutdown) return;
+
         synchronized (connectionLock) {
             if (isConnected) {
                 return;
             }
-            isConnected = true;
         }
 
         executor.submit(() -> {
+            if (isShutdown) return;
             try {
+                if (!client.isStarted()) {
+                    client.start();
+                }
                 logger.info("正在连接到服务器: " + uri);
-                client.start();
                 URI echoUri = new URI(uri);
                 ClientUpgradeRequest request = new ClientUpgradeRequest();
                 client.connect(this, echoUri, request);
             } catch (Exception e) {
-                logger.error("连接失败: " + e.getMessage());
-                synchronized (connectionLock) {
-                    isConnected = false;
+                // 如果是主动关闭，则不记录连接失败的错误
+                if (!isShutdown) {
+                    logger.error("连接失败: " + e.getMessage());
+                    synchronized (connectionLock) {
+                        isConnected = false;
+                    }
+                    reconnect();
                 }
-                reconnect();
             }
         });
     }
@@ -645,24 +693,30 @@ public class BridgeClient implements WebSocketListener {
     }
 
     public void reconnect() {
-        try {
-            TimeUnit.SECONDS.sleep(5);
-            logger.warn("正在尝试重连服务器");
-            connect();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            logger.error("重连已终止!");
+        if (isShutdown) {
+            return;
         }
+        executor.submit(() -> {
+            try {
+                if (isShutdown) return;
+                TimeUnit.SECONDS.sleep(5);
+                if (isShutdown) return;
+                logger.warn("正在尝试重连服务器");
+                connect();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
     }
 
     public void resetUrl(String newUrl) {
         try {
             logger.info("重置URL: " + newUrl);
+            // 这里不需要完全 shutdown，只需要关闭 session
             if (session != null) {
                 session.close();
             }
             this.uri = newUrl;
-            connect();
         } catch (Exception e) {
             logger.error("重置URL失败: " + e.getMessage());
         }
@@ -675,15 +729,46 @@ public class BridgeClient implements WebSocketListener {
     }
 
     public void close() {
+        // 1. 设置标志位，阻止任何新的重连或发送
+        isShutdown = true;
+        synchronized (connectionLock) {
+            isConnected = false;
+        }
+        ready = false;
+
+        logger.info("BridgeClient 正在关闭...");
         try {
-            if (session != null) {
+            if (heartbeatScheduler != null) {
+                heartbeatScheduler.shutdownNow();
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            if (session != null && session.isOpen()) {
                 session.close();
             }
-            timeoutScheduler.shutdown();
-            client.stop();
-            executor.shutdownNow();
         } catch (Exception e) {
-            logger.error("关闭连接失败: " + e.getMessage());
+            logger.error("关闭 Session 失败: " + e.getMessage());
         }
+
+        try {
+            if (client.isStarted()) {
+                client.stop();
+            }
+        } catch (Exception e) {
+            logger.error("停止 WebSocketClient 失败: " + e.getMessage());
+        }
+        try {
+            timeoutScheduler.shutdownNow();
+            executor.shutdownNow();
+            rpcExecutor.shutdownNow();
+            callbackTasks.values().forEach(f -> f.completeExceptionally(new CancellationException("Client closed")));
+            callbackTasks.clear();
+        } catch (Exception e) {
+            logger.error("关闭线程池失败: " + e.getMessage());
+        }
+
+        logger.info("BridgeClient 关闭完成。");
     }
 }
