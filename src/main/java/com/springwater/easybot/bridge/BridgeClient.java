@@ -114,8 +114,7 @@ public class BridgeClient implements WebSocketListener {
     public BridgeClient(String uri, BridgeBehavior behavior) {
         this.uri = uri;
         this.behavior = behavior;
-
-        QueuedThreadPool threadPool = new QueuedThreadPool(16);
+        QueuedThreadPool threadPool = new QueuedThreadPool();
         threadPool.setDaemon(true);
         threadPool.setName("EasyBotBridge-Jetty");
         SslContextFactory.Client sslContextFactory = new SslContextFactory.Client();

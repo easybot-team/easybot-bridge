@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'com.springwater.easybot'
-version = '1.6'
+version = '1.7-rc.1'
 
 repositories {
     mavenCentral()
