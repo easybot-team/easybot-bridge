@@ -528,6 +528,18 @@ public class BridgeClient implements WebSocketListener {
                         }
                         callBack.add("extensions", extensions);
                         break;
+                    case "MODULE_INSTALLED":
+                        ModuleInstalledPacked moduleInstalledPacked = gson.fromJson(message, ModuleInstalledPacked.class);
+                        callBack.addProperty("installed", behavior.moduleIsInstalled(moduleInstalledPacked.getModuleName()));
+                        break;
+                    case "MODULE_ENABLED":
+                        ModuleEnabledPacked moduleEnabledPacked = gson.fromJson(message, ModuleEnabledPacked.class);
+                        callBack.addProperty("enabled", behavior.moduleIsEnabled(moduleEnabledPacked.getModuleName()));
+                        break;
+                    case "IS_AUTHENTICATED":
+                        IsAuthenticatedPacket isAuthenticatedPacket = gson.fromJson(message, IsAuthenticatedPacket.class);
+                        callBack.addProperty("authenticated", behavior.isAuthenticated(isAuthenticatedPacket.getPlayerName()));
+                        break;
                     default: {
                         logger.info("收到未知操作: " + packet.getOperation() + " 请确保你的插件是最新版本????");
                         break;

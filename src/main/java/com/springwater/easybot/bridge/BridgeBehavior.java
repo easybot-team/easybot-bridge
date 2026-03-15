@@ -11,7 +11,10 @@ public interface BridgeBehavior {
     ServerInfo getInfo();
     void SyncToChat(String message);
     void BindSuccessBroadcast(String playerName,String accountId, String accountName);
-    void KickPlayer(String plauer, String kickMessage);
+    void KickPlayer(String player, String kickMessage);
     void SyncToChatExtra(List<Segment> segments, String text);
+    boolean moduleIsInstalled(String moduleName);
+    boolean moduleIsEnabled(String moduleName);
+    boolean isAuthenticated(String playerName);
     List<PlayerInfo> getPlayerList();
 }

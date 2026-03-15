@@ -7,8 +7,6 @@ import com.springwater.easybot.bridge.model.PlayerInfo;
 import com.springwater.easybot.bridge.model.ServerInfo;
 
 import java.util.*;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 public class MockBridgeBehavior implements BridgeBehavior {
 
@@ -49,13 +47,28 @@ public class MockBridgeBehavior implements BridgeBehavior {
     }
 
     @Override
-    public void KickPlayer(String plauer, String kickMessage) {
+    public void KickPlayer(String player, String kickMessage) {
 
     }
 
     @Override
     public void SyncToChatExtra(List<Segment> segments, String text) {
 
+    }
+
+    @Override
+    public boolean moduleIsInstalled(String moduleName) {
+        return moduleName.equals("test");
+    }
+
+    @Override
+    public boolean moduleIsEnabled(String moduleName) {
+        return moduleName.equals("test");
+    }
+
+    @Override
+    public boolean isAuthenticated(String playerName) {
+        return playerName.equals("MiuxuE");
     }
 
 
