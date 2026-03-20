@@ -9,6 +9,9 @@ import lombok.Setter;
 public class ImageSegment implements Segment{
     @SerializedName("url")
     private String url;
+    
+    @SerializedName("summary")
+    private String summary;
 
     @Override
     public String getRawText() {
@@ -17,6 +20,6 @@ public class ImageSegment implements Segment{
 
     @Override
     public String getText() {
-        return "[图片]";
+        return summary;
     }
 }
